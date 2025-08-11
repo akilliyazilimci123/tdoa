@@ -179,8 +179,8 @@ def generate_targets_near_receivers(
         # meters per deg approximate
         meters_per_deg_lat = 111_132.92 - 559.82 * math.cos(2 * math.radians(mean_lat)) + 1.175 * math.cos(4 * math.radians(mean_lat))
         meters_per_deg_lon = 111_412.84 * math.cos(math.radians(mean_lat)) - 93.5 * math.cos(3 * math.radians(mean_lat))
-        dlat_deg = (dn / meters_per_deg_lat) * (180.0 / math.pi)
-        dlon_deg = (de / meters_per_deg_lon) * (180.0 / math.pi)
+        dlat_deg = dn / meters_per_deg_lat
+        dlon_deg = de / meters_per_deg_lon
         lat = mean_lat + dlat_deg
         lon = mean_lon + dlon_deg
         alt = mean_alt + du
@@ -440,6 +440,29 @@ def calibrate_fibers_and_one_station(
 
 # ---------- Extra utilities ----------
 
+def meters_between_llh(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+    ea = geodetic_to_ecef(a[0], a[1], a[2])
+    eb = geodetic_to_ecef(b[0], b[1], b[2])
+    return float(np.linalg.norm(ea - eb))
+
+
+def clone_receivers_with_fibers(receivers: List[Receiver], fibers_ns: np.ndarray) -> List[Receiver]:
+    out: List[Receiver] = []
+    for r, f in zip(receivers, fibers_ns):
+        out.append(Receiver(r.receiver_id, r.lat_deg, r.lon_deg, r.alt_m, float(f)))
+    return out
+
+
+def clone_receivers_with_station(receivers: List[Receiver], s_id: int, new_llh: Tuple[float, float, float]) -> List[Receiver]:
+    out: List[Receiver] = []
+    for r in receivers:
+        if r.receiver_id == s_id:
+            out.append(Receiver(r.receiver_id, new_llh[0], new_llh[1], new_llh[2], r.fiber_delay_ns))
+        else:
+            out.append(Receiver(r.receiver_id, r.lat_deg, r.lon_deg, r.alt_m, r.fiber_delay_ns))
+    return out
+
+
 def cmd_apply_fiber_calibration(args):
     receivers = load_receivers(args.receivers)
     # Load calibration map receiver_id -> fiber_delay_est_ns
@@ -545,6 +568,124 @@ def cmd_calibrate_fibers_and_station(args):
         w.writerow([args.unknown_station_id, f"{lat_s:.7f}", f"{lon_s:.7f}", f"{alt_s:.3f}"])
 
 
+def cmd_self_test(args):
+    rng = np.random.default_rng(args.seed)
+    true_receivers = load_receivers(args.receivers)
+    num_rx = len(true_receivers)
+    true_fibers = np.array([r.fiber_delay_ns for r in true_receivers])
+
+    trials = args.num_trials
+    targ_per_trial = args.targets_per_trial
+
+    # Stats accumulators
+    pos_rmse_list = []
+    fiber_rel_rmse_list = []
+    joint_pos_rmse_list = []
+    joint_fiber_rel_rmse_list = []
+    station_err_m_list = []
+
+    for trial in range(trials):
+        # Generate targets
+        targets = generate_targets_near_receivers(true_receivers, targ_per_trial, args.max_radius_m, seed=int(rng.integers(0, 1_000_000)))
+        # Compute arrivals with true receivers and true fibers
+        arrivals = compute_arrivals(true_receivers, targets, c_m_per_ns=C_AIR_M_PER_NS)
+
+        # Create wrong fibers
+        if args.fiber_noise_ns_std > 0:
+            fiber_noise = rng.normal(0.0, args.fiber_noise_ns_std, size=num_rx)
+        else:
+            fiber_noise = np.zeros(num_rx)
+        wrong_fibers = true_fibers + fiber_noise
+        wrong_receivers = clone_receivers_with_fibers(true_receivers, wrong_fibers)
+
+        # Fiber-only calibration using true targets
+        f_est, _ = calibrate_fiber_delays_relative(wrong_receivers, arrivals, targets, c_m_per_ns=C_AIR_M_PER_NS)
+        # Evaluate relative fiber error
+        rel_true = true_fibers - true_fibers[0]
+        rel_est = f_est - f_est[0]
+        rel_err = rel_est - rel_true
+        fiber_rel_rmse = float(np.sqrt(np.mean(rel_err[1:] ** 2)))  # exclude ref 0
+        fiber_rel_rmse_list.append(fiber_rel_rmse)
+
+        # Apply estimated fibers and re-estimate positions; TDOA should be insensitive to absolute offset
+        rec_cal = clone_receivers_with_fibers(true_receivers, f_est)
+        # Use arrivals from true setup; estimate target positions with rec_cal (which differs only by fiber gauge)
+        est_targets = batch_estimate_targets(rec_cal, arrivals, c_m_per_ns=C_AIR_M_PER_NS)
+        # Compute position RMSE in meters
+        errs = []
+        for t_true, t_est in zip(targets, est_targets):
+            e = meters_between_llh((t_true.lat_deg, t_true.lon_deg, t_true.alt_m), (t_est.lat_deg, t_est.lon_deg, t_est.alt_m))
+            errs.append(e)
+        pos_rmse = float(np.sqrt(np.mean(np.square(errs)))) if errs else 0.0
+        pos_rmse_list.append(pos_rmse)
+
+        if args.station_noise_m_std > 0:
+            # Pick station id
+            s_id = args.unknown_station_id
+            # Perturb station position in ENU around its own location
+            s = true_receivers[s_id]
+            enu_noise = rng.normal(0.0, args.station_noise_m_std, size=3)
+            s_ecef = s.to_ecef()
+            lat0, lon0, alt0 = s.lat_deg, s.lon_deg, s.alt_m
+            s_enu = np.array([0.0, 0.0, 0.0])
+            s_ecef_pert = enu_to_ecef(enu_noise, lat0, lon0, alt0)
+            # Convert back to geodetic for wrong receiver list
+            s_lat, s_lon, s_alt = ecef_to_geodetic(s_ecef_pert)
+            wrong_receivers_joint = clone_receivers_with_station(wrong_receivers, s_id, (s_lat, s_lon, s_alt))
+            # Joint calibration
+            f_joint_est, r_s_est = calibrate_fibers_and_one_station(wrong_receivers_joint, arrivals, targets, unknown_station_id=s_id, c_m_per_ns=C_AIR_M_PER_NS)
+            rel_joint = f_joint_est - f_joint_est[0]
+            rel_err_joint = rel_joint - rel_true
+            joint_fiber_rel_rmse = float(np.sqrt(np.mean(rel_err_joint[1:] ** 2)))
+            joint_fiber_rel_rmse_list.append(joint_fiber_rel_rmse)
+            # Station error
+            s_true_llh = (s.lat_deg, s.lon_deg, s.alt_m)
+            s_est_llh = ecef_to_geodetic(r_s_est)
+            station_err_m = meters_between_llh(s_true_llh, s_est_llh)
+            station_err_m_list.append(station_err_m)
+            # After joint calib, update receivers and re-estimate positions
+            rec_joint_cal = clone_receivers_with_fibers(true_receivers, f_joint_est)
+            est_targets_joint = batch_estimate_targets(rec_joint_cal, arrivals, c_m_per_ns=C_AIR_M_PER_NS)
+            errs_joint = []
+            for t_true, t_est in zip(targets, est_targets_joint):
+                e = meters_between_llh((t_true.lat_deg, t_true.lon_deg, t_true.alt_m), (t_est.lat_deg, t_est.lon_deg, t_est.alt_m))
+                errs_joint.append(e)
+            joint_pos_rmse = float(np.sqrt(np.mean(np.square(errs_joint)))) if errs_joint else 0.0
+            joint_pos_rmse_list.append(joint_pos_rmse)
+
+    def summarize(arr):
+        if not arr:
+            return (None, None, None)
+        a = np.array(arr)
+        return (float(np.mean(a)), float(np.median(a)), float(np.percentile(a, 95)))
+
+    fiber_mean, fiber_med, fiber_p95 = summarize(fiber_rel_rmse_list)
+    pos_mean, pos_med, pos_p95 = summarize(pos_rmse_list)
+    joint_fiber_mean, joint_fiber_med, joint_fiber_p95 = summarize(joint_fiber_rel_rmse_list)
+    joint_pos_mean, joint_pos_med, joint_pos_p95 = summarize(joint_pos_rmse_list)
+    st_mean, st_med, st_p95 = summarize(station_err_m_list)
+
+    # Print concise report
+    print("Fiber-only calibration (relative, ns): RMSE mean/median/p95 = ", fiber_mean, fiber_med, fiber_p95)
+    print("Post-calibration position RMSE (m):    mean/median/p95 = ", pos_mean, pos_med, pos_p95)
+    if station_err_m_list:
+        print("Joint calib fiber (relative, ns):    RMSE mean/median/p95 = ", joint_fiber_mean, joint_fiber_med, joint_fiber_p95)
+        print("Joint calib station error (m):       mean/median/p95 = ", st_mean, st_med, st_p95)
+        print("Joint post-calib pos RMSE (m):       mean/median/p95 = ", joint_pos_mean, joint_pos_med, joint_pos_p95)
+
+    # Optional CSV report
+    if args.report:
+        with open(args.report, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["metric", "mean", "median", "p95"])
+            w.writerow(["fiber_rel_rmse_ns", fiber_mean, fiber_med, fiber_p95])
+            w.writerow(["pos_rmse_m", pos_mean, pos_med, pos_p95])
+            if station_err_m_list:
+                w.writerow(["joint_fiber_rel_rmse_ns", joint_fiber_mean, joint_fiber_med, joint_fiber_p95])
+                w.writerow(["joint_station_err_m", st_mean, st_med, st_p95])
+                w.writerow(["joint_pos_rmse_m", joint_pos_mean, joint_pos_med, joint_pos_p95])
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="TDOA solver and calibration tool")
     sub = p.add_subparsers(required=True)
@@ -596,6 +737,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     us.add_argument("--station-csv", required=True)
     us.add_argument("--output", required=True)
     us.set_defaults(func=cmd_update_station_from_csv)
+
+    st = sub.add_parser("self-test", help="Monte Carlo self-test for calibration and solver")
+    st.add_argument("--receivers", required=True)
+    st.add_argument("--num-trials", type=int, default=100)
+    st.add_argument("--targets-per-trial", type=int, default=4)
+    st.add_argument("--max-radius-m", type=float, default=10_000.0)
+    st.add_argument("--fiber-noise-ns-std", type=float, default=50.0)
+    st.add_argument("--station-noise-m-std", type=float, default=10.0)
+    st.add_argument("--unknown-station-id", type=int, default=2)
+    st.add_argument("--seed", type=int, default=123)
+    st.add_argument("--report", default="")
+    st.set_defaults(func=cmd_self_test)
 
     return p
 
