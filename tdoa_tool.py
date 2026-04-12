@@ -1,48 +1,130 @@
+"""
+TDOA (Time Difference of Arrival) Tabanlı Konum Belirleme ve Kalibrasyon Aracı
+
+Bu modül, TDOA tabanlı konum belirleme sistemleri için şu özellikleri sunar:
+- Jeodezik dönüşümler (WGS84 <-> ECEF <-> ENU)
+- Sentetik hedef ve varış zamanı üretimi
+- TDOA ile konum tahmini (Levenberg-Marquardt optimizasyonu)
+- Fiber gecikme kalibrasyonu
+- Joint kalibrasyon (fiber + istasyon pozisyonu)
+- Monte Carlo self-test
+
+Kullanım Örnekleri:
+    python tdoa_tool.py generate-targets --receivers receivers.csv --output targets.csv
+    python tdoa_tool.py compute-arrivals --receivers receivers.csv --targets targets.csv --output arrivals.csv
+    python tdoa_tool.py estimate-targets --receivers receivers.csv --arrivals arrivals.csv --output estimated.csv
+    python tdoa_tool.py calibrate-fibers --receivers receivers.csv --arrivals arrivals.csv --targets-true targets_true.csv --output calibration.csv
+    python tdoa_tool.py self-test --receivers receivers.csv --report report.csv
+
+Yazar: TDOA Tool Team
+Lisans: MIT
+"""
+
 import argparse
 import csv
+import logging
 import math
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from numpy.typing import NDArray
+
+# Logging konfigürasyonu
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
 # Physical constants
-C_VACUUM_M_PER_NS = 0.299_792_458  # m/ns
-REFRACTIVE_INDEX_AIR = 1.000_293
-C_AIR_M_PER_NS = C_VACUUM_M_PER_NS / REFRACTIVE_INDEX_AIR
+C_VACUUM_M_PER_NS: float = 0.299_792_458  # m/ns
+REFRACTIVE_INDEX_AIR: float = 1.000_293
+C_AIR_M_PER_NS: float = C_VACUUM_M_PER_NS / REFRACTIVE_INDEX_AIR
 
 # WGS84 constants
-WGS84_A = 6378137.0  # semi-major axis in meters
-WGS84_F = 1 / 298.257223563
-WGS84_E2 = WGS84_F * (2 - WGS84_F)
+WGS84_A: float = 6378137.0  # semi-major axis in meters
+WGS84_F: float = 1 / 298.257223563
+WGS84_E2: float = WGS84_F * (2 - WGS84_F)
 
 
 @dataclass
 class Receiver:
+    """Alıcı istasyon bilgilerini tutan veri sınıfı.
+    
+    Attributes:
+        receiver_id: Alıcı benzersiz kimliği
+        lat_deg: Enlem (derece)
+        lon_deg: Boylam (derece)
+        alt_m: Yükseklik (metre)
+        fiber_delay_ns: Fiber optik kablo gecikmesi (nanosecond)
+    """
     receiver_id: int
     lat_deg: float
     lon_deg: float
     alt_m: float
     fiber_delay_ns: float
 
-    def to_ecef(self) -> np.ndarray:
+    def to_ecef(self) -> NDArray[np.float64]:
+        """Alıcı pozisyonunu ECEF koordinatlarına dönüştürür.
+        
+        Returns:
+            ECEF koordinat vektörü [x, y, z] metre cinsinden
+        """
         return geodetic_to_ecef(self.lat_deg, self.lon_deg, self.alt_m)
 
 
 @dataclass
 class Target:
+    """Hedef nesne bilgilerini tutan veri sınıfı.
+    
+    Attributes:
+        target_id: Hedef benzersiz kimliği
+        lat_deg: Enlem (derece)
+        lon_deg: Boylam (derece)
+        alt_m: Yükseklik (metre)
+    """
     target_id: int
     lat_deg: float
     lon_deg: float
     alt_m: float
 
-    def to_ecef(self) -> np.ndarray:
+    def to_ecef(self) -> NDArray[np.float64]:
+        """Hedef pozisyonunu ECEF koordinatlarına dönüştürür.
+        
+        Returns:
+            ECEF koordinat vektörü [x, y, z] metre cinsinden
+        """
         return geodetic_to_ecef(self.lat_deg, self.lon_deg, self.alt_m)
 
 
 # ---------- Geodesy ----------
 
-def geodetic_to_ecef(lat_deg: float, lon_deg: float, alt_m: float) -> np.ndarray:
+
+def geodetic_to_ecef(lat_deg: float, lon_deg: float, alt_m: float) -> NDArray[np.float64]:
+    """Jeodezik koordinatları (enlem, boylam, yükseklik) ECEF koordinatlarına dönüştürür.
+    
+    WGS84 elipsoid modeli kullanılır.
+    
+    Args:
+        lat_deg: Enlem (derece)
+        lon_deg: Boylam (derece)
+        alt_m: Yükseklik (metre)
+        
+    Returns:
+        ECEF koordinat vektörü [x, y, z] metre cinsinden
+        
+    Raises:
+        ValueError: Geçersiz koordinat değerleri için
+    """
+    if not (-90 <= lat_deg <= 90):
+        raise ValueError(f"Enlem değeri -90 ile 90 arasında olmalıdır: {lat_deg}")
+    if not (-180 <= lon_deg <= 180):
+        raise ValueError(f"Boylam değeri -180 ile 180 arasında olmalıdır: {lon_deg}")
+    
     lat = math.radians(lat_deg)
     lon = math.radians(lon_deg)
     sin_lat = math.sin(lat)
@@ -53,44 +135,120 @@ def geodetic_to_ecef(lat_deg: float, lon_deg: float, alt_m: float) -> np.ndarray
     x = (N + alt_m) * cos_lat * cos_lon
     y = (N + alt_m) * cos_lat * sin_lon
     z = (N * (1 - WGS84_E2) + alt_m) * sin_lat
-    return np.array([x, y, z], dtype=float)
+    return np.array([x, y, z], dtype=np.float64)
 
 
-def ecef_to_geodetic(xyz: np.ndarray) -> Tuple[float, float, float]:
+def ecef_to_geodetic(xyz: NDArray[np.float64]) -> Tuple[float, float, float]:
+    """ECEF koordinatlarını jeodezik koordinatlara (enlem, boylam, yükseklik) dönüştürür.
+    
+    WGS84 elipsoid modeli ve iteratif yöntem kullanılır.
+    
+    Args:
+        xyz: ECEF koordinat vektörü [x, y, z] metre cinsinden
+        
+    Returns:
+        Tuple (lat_deg, lon_deg, alt_m):
+            - lat_deg: Enlem (derece)
+            - lon_deg: Boylam (derece)
+            - alt_m: Yükseklik (metre)
+            
+    Raises:
+        ValueError: Geçersiz ECEF koordinatları için
+    """
+    if len(xyz) != 3:
+        raise ValueError(f"ECEF vektörü 3 elemanlı olmalıdır: {len(xyz)}")
+    
     x, y, z = xyz
     lon = math.atan2(y, x)
     p = math.hypot(x, y)
     lat = math.atan2(z, p * (1 - WGS84_E2))
-    for _ in range(6):
+    
+    # İteratif çözüm (genellikle 5-6 iterasyonda yakınsar)
+    for iteration in range(6):
         sin_lat = math.sin(lat)
         N = WGS84_A / math.sqrt(1 - WGS84_E2 * sin_lat * sin_lat)
-        alt = p / max(1e-12, math.cos(lat)) - N
+        if abs(math.cos(lat)) < 1e-12:
+            logger.warning("Kutup noktasına yakın konum, alternatif hesaplama kullanılıyor")
+            alt = p / 1e-12 - N
+        else:
+            alt = p / math.cos(lat) - N
+        if abs(N + alt) < 1e-12:
+            break
         lat = math.atan2(z, p * (1 - WGS84_E2 * (N / (N + alt))))
+    
     sin_lat = math.sin(lat)
     N = WGS84_A / math.sqrt(1 - WGS84_E2 * sin_lat * sin_lat)
-    alt = p / max(1e-12, math.cos(lat)) - N
+    if abs(math.cos(lat)) < 1e-12:
+        alt = p / 1e-12 - N
+    else:
+        alt = p / math.cos(lat) - N
+    
     return (math.degrees(lat), math.degrees(lon), alt)
 
 
-def enu_rotation_matrix(lat0_deg: float, lon0_deg: float) -> np.ndarray:
+def enu_rotation_matrix(lat0_deg: float, lon0_deg: float) -> NDArray[np.float64]:
+    """Yerel ENU (East-North-Up) koordinat sistemine dönüşüm için rotasyon matrisi oluşturur.
+    
+    Args:
+        lat0_deg: Referans noktası enlemi (derece)
+        lon0_deg: Referans noktası boylamı (derece)
+        
+    Returns:
+        3x3 rotasyon matrisi (ECEF -> ENU)
+    """
     lat = math.radians(lat0_deg)
     lon = math.radians(lon0_deg)
     sin_lat, cos_lat = math.sin(lat), math.cos(lat)
     sin_lon, cos_lon = math.sin(lon), math.cos(lon)
-    e = np.array([-sin_lon, cos_lon, 0.0])
-    n = np.array([-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat])
-    u = np.array([cos_lat * cos_lon, cos_lat * sin_lon, sin_lat])
+    
+    # ENU eksen vektörleri
+    e = np.array([-sin_lon, cos_lon, 0.0], dtype=np.float64)
+    n = np.array([-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat], dtype=np.float64)
+    u = np.array([cos_lat * cos_lon, cos_lat * sin_lon, sin_lat], dtype=np.float64)
+    
     R = np.vstack([e, n, u])
     return R
 
 
-def ecef_to_enu(xyz: np.ndarray, ref_lat_deg: float, ref_lon_deg: float, ref_alt_m: float) -> np.ndarray:
+def ecef_to_enu(
+    xyz: NDArray[np.float64], 
+    ref_lat_deg: float, 
+    ref_lon_deg: float, 
+    ref_alt_m: float
+) -> NDArray[np.float64]:
+    """ECEF koordinatlarını yerel ENU koordinatlarına dönüştürür.
+    
+    Args:
+        xyz: ECEF koordinat vektörü [x, y, z] metre cinsinden
+        ref_lat_deg: Referans noktası enlemi (derece)
+        ref_lon_deg: Referans noktası boylamı (derece)
+        ref_alt_m: Referans noktası yüksekliği (metre)
+        
+    Returns:
+        ENU koordinat vektörü [east, north, up] metre cinsinden
+    """
     ref = geodetic_to_ecef(ref_lat_deg, ref_lon_deg, ref_alt_m)
     R = enu_rotation_matrix(ref_lat_deg, ref_lon_deg)
     return R @ (xyz - ref)
 
 
-def enu_to_ecef(enu: np.ndarray, ref_lat_deg: float, ref_lon_deg: float, ref_alt_m: float) -> np.ndarray:
+def enu_to_ecef(
+    enu: NDArray[np.float64], 
+    ref_lat_deg: float, 
+    ref_lon_deg: float, 
+    ref_alt_m: float
+) -> NDArray[np.float64]:
+    """Yerel ENU koordinatlarını ECEF koordinatlarına dönüştürür.
+    
+    Args:
+        enu: ENU koordinat vektörü [east, north, up] metre cinsinden
+        ref_lat_deg: Referans noktası enlemi (derece)
+        ref_lon_deg: Referans noktası boylamı (derece)
+        ref_alt_m: Referans noktası yüksekliği (metre)
+        
+    Returns:
+        ECEF koordinat vektörü [x, y, z] metre cinsinden
+    """
     ref = geodetic_to_ecef(ref_lat_deg, ref_lon_deg, ref_alt_m)
     R = enu_rotation_matrix(ref_lat_deg, ref_lon_deg)
     return ref + R.T @ enu
@@ -98,61 +256,169 @@ def enu_to_ecef(enu: np.ndarray, ref_lat_deg: float, ref_lon_deg: float, ref_alt
 
 # ---------- IO helpers ----------
 
+
+class TDOAFileError(Exception):
+    """TDOA dosya işlemleri için özel hata sınıfı."""
+    pass
+
+
 def load_receivers(path: str) -> List[Receiver]:
+    """Alıcı bilgilerini CSV dosyasından yükler.
+    
+    Args:
+        path: CSV dosya yolu
+        
+    Returns:
+        Receiver nesneleri listesi
+        
+    Raises:
+        TDOAFileError: Dosya okuma hatası durumunda
+        FileNotFoundError: Dosya bulunamadığında
+    """
     receivers: List[Receiver] = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for idx, row in enumerate(reader):
-            receivers.append(
-                Receiver(
-                    receiver_id=idx,
-                    lat_deg=float(row["lat"]),
-                    lon_deg=float(row["lon"]),
-                    alt_m=float(row["alt_m"]),
-                    fiber_delay_ns=float(row["fiber_delay_ns"]),
-                )
-            )
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            for idx, row in enumerate(reader):
+                try:
+                    receivers.append(
+                        Receiver(
+                            receiver_id=idx,
+                            lat_deg=float(row["lat"]),
+                            lon_deg=float(row["lon"]),
+                            alt_m=float(row["alt_m"]),
+                            fiber_delay_ns=float(row["fiber_delay_ns"]),
+                        )
+                    )
+                except (KeyError, ValueError) as e:
+                    raise TDOAFileError(f"Satır {idx + 2} okuma hatası: {e}") from e
+    except FileNotFoundError:
+        logger.error(f"Dosya bulunamadı: {path}")
+        raise
+    except Exception as e:
+        logger.error(f"Alıcı dosyası okuma hatası: {e}")
+        raise TDOAFileError(f"Alıcı dosyası okunamadı: {e}") from e
+    
+    if len(receivers) < 3:
+        logger.warning(f"Yetersiz alıcı sayısı: {len(receivers)}. TDOA için en az 3 alıcı önerilir.")
+    
     return receivers
 
 
 def save_targets(path: str, targets: List[Target]) -> None:
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["lat", "lon", "alt_m"])
-        for t in targets:
-            writer.writerow([f"{t.lat_deg:.7f}", f"{t.lon_deg:.7f}", f"{t.alt_m:.3f}"])
+    """Hedef bilgilerini CSV dosyasına kaydeder.
+    
+    Args:
+        path: Çıktı CSV dosya yolu
+        targets: Target nesneleri listesi
+        
+    Raises:
+        IOError: Dosya yazma hatası durumunda
+    """
+    try:
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["target_id", "lat", "lon", "alt_m"])
+            for t in targets:
+                writer.writerow([t.target_id, f"{t.lat_deg:.7f}", f"{t.lon_deg:.7f}", f"{t.alt_m:.3f}"])
+        logger.info(f"{len(targets)} hedef '{path}' dosyasına kaydedildi.")
+    except Exception as e:
+        logger.error(f"Hedef dosyası yazma hatası: {e}")
+        raise IOError(f"Hedef dosyasına yazılamadı: {e}") from e
 
 
 def load_targets(path: str) -> List[Target]:
+    """Hedef bilgilerini CSV dosyasından yükler.
+    
+    Args:
+        path: CSV dosya yolu
+        
+    Returns:
+        Target nesneleri listesi
+        
+    Raises:
+        TDOAFileError: Dosya okuma hatası durumunda
+    """
     targets: List[Target] = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for idx, row in enumerate(reader):
-            targets.append(
-                Target(
-                    target_id=idx,
-                    lat_deg=float(row["lat"]),
-                    lon_deg=float(row["lon"]),
-                    alt_m=float(row["alt_m"]),
-                )
-            )
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            for idx, row in enumerate(reader):
+                try:
+                    targets.append(
+                        Target(
+                            target_id=idx,
+                            lat_deg=float(row["lat"]),
+                            lon_deg=float(row["lon"]),
+                            alt_m=float(row["alt_m"]),
+                        )
+                    )
+                except (KeyError, ValueError) as e:
+                    raise TDOAFileError(f"Satır {idx + 2} okuma hatası: {e}") from e
+    except FileNotFoundError:
+        logger.error(f"Dosya bulunamadı: {path}")
+        raise
+    except Exception as e:
+        logger.error(f"Hedef dosyası okuma hatası: {e}")
+        raise TDOAFileError(f"Hedef dosyası okunamadı: {e}") from e
+    
     return targets
 
 
 def save_arrivals(path: str, arrivals: List[Tuple[int, int, float]]) -> None:
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["target_id", "receiver_id", "arrival_time_ns"])
-        for tgt_id, rx_id, t_ns in arrivals:
-            writer.writerow([tgt_id, rx_id, f"{t_ns:.8f}"])
+    """Varış zamanlarını CSV dosyasına kaydeder.
+    
+    Args:
+        path: Çıktı CSV dosya yolu
+        arrivals: (target_id, receiver_id, arrival_time_ns) tuple'ları listesi
+        
+    Raises:
+        IOError: Dosya yazma hatası durumunda
+    """
+    try:
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["target_id", "receiver_id", "arrival_time_ns"])
+            for tgt_id, rx_id, t_ns in arrivals:
+                writer.writerow([tgt_id, rx_id, f"{t_ns:.8f}"])
+        logger.info(f"{len(arrivals)} varış zamanı '{path}' dosyasına kaydedildi.")
+    except Exception as e:
+        logger.error(f"Varış zamanı dosyası yazma hatası: {e}")
+        raise IOError(f"Varış zamanı dosyasına yazılamadı: {e}") from e
 
 
 def load_arrivals(path: str) -> List[Tuple[int, int, float]]:
+    """Varış zamanlarını CSV dosyasından yükler.
+    
+    Args:
+        path: CSV dosya yolu
+        
+    Returns:
+        (target_id, receiver_id, arrival_time_ns) tuple'ları listesi
+        
+    Raises:
+        TDOAFileError: Dosya okuma hatası durumunda
+    """
     out: List[Tuple[int, int, float]] = []
-    with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            out.append((int(row["target_id"]), int(row["receiver_id"]), float(row["arrival_time_ns"])) )
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            for idx, row in enumerate(reader):
+                try:
+                    out.append((
+                        int(row["target_id"]), 
+                        int(row["receiver_id"]), 
+                        float(row["arrival_time_ns"])
+                    ))
+                except (KeyError, ValueError) as e:
+                    raise TDOAFileError(f"Satır {idx + 2} okuma hatası: {e}") from e
+    except FileNotFoundError:
+        logger.error(f"Dosya bulunamadı: {path}")
+        raise
+    except Exception as e:
+        logger.error(f"Varış zamanı dosyası okuma hatası: {e}")
+        raise TDOAFileError(f"Varış zamanı dosyası okunamadı: {e}") from e
+    
     return out
 
 
